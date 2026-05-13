@@ -319,7 +319,7 @@
                         <div className="flex justify-center mb-6"><div className="bg-indigo-100 p-4 rounded-full"><i data-lucide="lock" className="w-8 h-8 text-indigo-600"></i></div></div>
                         <h2 className="text-2xl font-bold text-slate-800 mb-2 text-center">ROI 預測儀表板</h2>
                         <p className="text-sm text-slate-500 mb-8 text-center">受保護的應用程式，請輸入密碼</p>
-                        <input type="password" value={passwordInput} onChange={e => {setPasswordInput(e.target.value); setLoginError(false);}} onKeyDown={e => e.key === 'Enter' && handleLogin()} className={`w-full px-4 py-3 border ${loginError ? 'border-red-300' : 'border-slate-300'} rounded-xl mb-2 text-center focus:outline-none focus:ring-2 focus:ring-indigo-500`} placeholder="請輸入密碼 3293" />
+                        <input type="password" value={passwordInput} onChange={e => {setPasswordInput(e.target.value); setLoginError(false);}} onKeyDown={e => e.key === 'Enter' && handleLogin()} className={`w-full px-4 py-3 border ${loginError ? 'border-red-300' : 'border-slate-300'} rounded-xl mb-2 text-center focus:outline-none focus:ring-2 focus:ring-indigo-500`} placeholder="請輸入密碼" />
                         {loginError && <p className="text-red-500 text-xs mb-4 text-center">密碼錯誤，請再試一次</p>}
                         <button onClick={handleLogin} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl transition-all shadow-sm">進入系統</button>
                     </div>
