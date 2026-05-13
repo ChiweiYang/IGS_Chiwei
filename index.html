@@ -19,6 +19,8 @@
         body { background-color: #f8fafc; font-family: sans-serif; }
         .recharts-default-tooltip { border: none !important; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1) !important; border-radius: 12px !important; }
         input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; filter: invert(0.5); }
+        .animation-fade-in { animation: fadeIn 0.5s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body>
@@ -62,7 +64,10 @@
             const [roiMap, setRoiMap] = useState({});
             const [costMap, setCostMap] = useState({});
             const [retMap, setRetMap] = useState({});
+            
+            // 預設未來成本 50,000,000
             const [defaultFutureCost, setDefaultFutureCost] = useState(50000000);
+            
             const [cutoffDate, setCutoffDate] = useState('');
             const [filterYear, setFilterYear] = useState('All'); 
             const [selectedCohorts, setSelectedCohorts] = useState([]);
@@ -77,56 +82,72 @@
                 if (window.lucide) window.lucide.createIcons();
             });
 
+            // 修復 3：預設顯示「所有的」月份 (不再受限於2026/12)
             useEffect(() => {
                 const defaultView = filterYear === 'All' 
-                    ? allMonths.filter(m => m >= '2025/01' && m <= '2026/12') 
+                    ? allMonths 
                     : allMonths.filter(m => m.startsWith(filterYear));
                 setSelectedCohorts(defaultView);
             }, [filterYear]);
 
             // --------------------------------------------------------
-            // 核心預測引擎：優化銜接邏輯
+            // 核心預測引擎：強力防禦 NaN 污染，完美接軌預測線
             // --------------------------------------------------------
             const projectedData = useMemo(() => {
                 const avgRet = []; const avgInc = [];
+                
+                // 計算歷史平均衰退序列
                 for (let i = 0; i <= 60; i++) {
                     let sumRet = 0, countRet = 0, sumInc = 0, countInc = 0;
                     allMonths.forEach(m => {
-                        if (retMap[m] && retMap[m][i] !== undefined) { sumRet += retMap[m][i]; countRet++; }
+                        if (retMap[m] && !isNaN(retMap[m][i])) { 
+                            sumRet += retMap[m][i]; countRet++; 
+                        }
                         if (roiMap[m] && i < roiMap[m].length) { 
-                            let inc = i === 0 ? roiMap[m][0] : (roiMap[m][i] - roiMap[m][i-1]); 
-                            sumInc += Math.max(0, inc); countInc++; 
+                            let inc = i === 0 ? roiMap[m][0] : (roiMap[m][i] - (roiMap[m][i-1] || 0)); 
+                            if (!isNaN(inc)) { sumInc += Math.max(0, inc); countInc++; }
                         }
                     });
-                    // 若無留存率實際數據，則使用 0.8 作為預設衰退
-                    avgRet[i] = countRet > 0 ? sumRet / countRet : (i === 0 ? 100 : (avgRet[i-1] * 0.85));
-                    avgInc[i] = countInc > 0 ? sumInc / countInc : (i === 0 ? 30 : (avgInc[i-1] * 0.8));
+                    
+                    avgRet[i] = countRet > 0 ? sumRet / countRet : (i === 0 ? 100 : ((avgRet[i-1] || 100) * 0.85));
+                    avgInc[i] = countInc > 0 ? sumInc / countInc : (i === 0 ? 30 : ((avgInc[i-1] || 30) * 0.8));
                 }
 
                 const fullCohorts = {};
                 allMonths.forEach(month => {
                     const actualCum = roiMap[month] || [];
                     const cohortCost = costMap[month] !== undefined ? costMap[month] : defaultFutureCost;
+                    
                     const predCum = []; const predInc = [];
                     let currentCum = 0; let lastInc = 0;
 
                     for (let i = 0; i <= 36; i++) {
                         if (i < actualCum.length) {
+                            // 實際發生過的值
                             currentCum = actualCum[i]; 
                             lastInc = i === 0 ? currentCum : (actualCum[i] - (actualCum[i-1] || 0));
                         } else {
-                            // 計算衰退係數
-                            let decay = 0.8;
-                            if (avgRet[i] && avgRet[i-1] > 0) decay = avgRet[i] / avgRet[i-1];
-                            else if (avgInc[i] && avgInc[i-1] > 0) decay = avgInc[i] / avgInc[i-1];
-                            
-                            decay = Math.max(0.05, Math.min(0.99, decay)); // 限制衰退率
-
+                            // 預測未來的走勢
                             let nextInc = 0;
                             if (actualCum.length === 0 && i === 0) {
+                                // 整個月份都尚未發生，套用 M0 平均起點
                                 nextInc = avgInc[0] || 35; 
                             } else {
-                                nextInc = lastInc * decay;
+                                // 該月已有部分實際資料，使用歷史衰退率推算後續
+                                let decay = 0.8;
+                                if (avgRet[i] && avgRet[i-1] > 0 && !isNaN(avgRet[i]) && !isNaN(avgRet[i-1])) {
+                                    decay = avgRet[i] / avgRet[i-1];
+                                } else if (avgInc[i] && avgInc[i-1] > 0 && !isNaN(avgInc[i]) && !isNaN(avgInc[i-1])) {
+                                    decay = avgInc[i] / avgInc[i-1];
+                                }
+                                
+                                decay = Math.max(0.05, Math.min(0.99, decay)); // 確保不會暴衝或歸零
+                                
+                                if (lastInc <= 0) {
+                                    nextInc = avgInc[i] || 0; // 若上期增量為 0，則參考大盤平均
+                                } else {
+                                    nextInc = lastInc * decay;
+                                }
                             }
                             currentCum += nextInc;
                             lastInc = nextInc;
@@ -139,6 +160,7 @@
                 return fullCohorts;
             }, [roiMap, costMap, retMap, defaultFutureCost]);
 
+            // 準備圖表繪製數據
             const cumulativeChartData = useMemo(() => {
                 const data = [];
                 for (let i = 0; i <= 36; i++) {
@@ -148,6 +170,7 @@
                         if (cData) {
                             if (i < cData.actualLen) { 
                                 row[`${month}_act`] = parseFloat(cData.cum[i].toFixed(2)); 
+                                // 接合虛線：在實線的最後一點同時畫虛線的起點
                                 if (i === cData.actualLen - 1) row[`${month}_pred`] = parseFloat(cData.cum[i].toFixed(2)); 
                             }
                             else { 
@@ -165,11 +188,13 @@
                     const targetIdx = allMonths.indexOf(targetMonth);
                     let newRev = 0, retRev = 0;
                     const budget = projectedData[targetMonth]?.cost || defaultFutureCost;
+                    
                     allMonths.forEach(cohort => {
                         const cIdx = allMonths.indexOf(cohort);
                         if (cIdx <= targetIdx && targetIdx - cIdx <= 36) {
                             const age = targetIdx - cIdx;
                             const cData = projectedData[cohort];
+                            // 營收 = 該梯次當初的投入成本 * 該年齡的新增ROI
                             const rev = cData.cost * ((cData.inc[age] || 0) / 100.0);
                             if (age === 0) newRev += rev; else retRev += rev;
                         }
@@ -180,7 +205,7 @@
 
             const normalizeMonthString = (rawStr) => {
                 if (!rawStr) return null;
-                let s = String(rawStr).trim();
+                let s = String(rawStr).trim().replace(/['"]/g, '');
                 if (!isNaN(s) && Number(s) > 30000) { const d = new Date(Math.round((Number(s)-25569)*86400*1000)); return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}`; }
                 s = s.replace(/[-_年\.]/g, '/').replace(/月/g, '');
                 const mYm = s.match(/^(\d{2,4})\/(\d{1,2})/);
@@ -190,6 +215,9 @@
 
             const handleLogin = () => { if (passwordInput === '3293') { setIsAuthenticated(true); } else { setLoginError(true); } };
 
+            // --------------------------------------------------------
+            // 檔案上傳與極端防呆處理
+            // --------------------------------------------------------
             const handleUpload = (e, type) => {
                 const file = e.target.files[0];
                 if (!file) return;
@@ -209,44 +237,70 @@
                         const wb = XLSX.read(dataArray, { type: 'array' });
                         const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, defval: null });
                         let updatedCount = 0;
-                        let lastSeenMonth = null;
+                        let scaledNotice = false;
 
                         if (type === 'roi') {
-                            const newRoiMap = { ...roiMap }; const newCostMap = { ...costMap };
+                            const newRoiMap = { ...roiMap }; 
+                            const newCostMap = { ...costMap };
+
                             data.forEach(row => {
                                 const keys = Object.keys(row);
+                                
+                                const itemKey = keys.find(k => ['項目', '類別'].includes(k));
+                                if (itemKey && row[itemKey]) {
+                                    const itemStr = String(row[itemKey]);
+                                    if (itemStr.includes('留存') || itemStr.includes('新進') || itemStr.includes('老玩家')) return; 
+                                }
+
                                 const monthKey = keys.find(k => ['month', '年/月', '年月', '月份', '日期'].includes(k.replace(/[\s\u200B]/g, '').toLowerCase()));
-                                let month = normalizeMonthString(monthKey ? row[monthKey] : null);
-                                if (month) lastSeenMonth = month; else month = lastSeenMonth;
+                                const month = normalizeMonthString(monthKey ? row[monthKey] : null);
                                 if (!month) return;
 
-                                const costKey = keys.find(k => k.includes('cost') || k.includes('成本') || k.includes('花費') || k.includes('人數或花費'));
-                                if (costKey && row[costKey] !== null) newCostMap[month] = parseFloat(String(row[costKey]).replace(/[%$, ]/g, ''));
+                                // 修復 1：過濾無效成本，保證 50,000,000 的預設值能在未來月份生效
+                                const costKey = keys.find(k => k.includes('cost') || k.includes('成本') || k.includes('花費') || k.includes('預算') || k.includes('人數或花費'));
+                                if (costKey && row[costKey] !== null && row[costKey] !== undefined) {
+                                    let costStr = String(row[costKey]).replace(/[%$, '"，]/g, '').trim();
+                                    if (costStr !== '' && costStr !== '-') {
+                                        let costVal = parseFloat(costStr);
+                                        if (!isNaN(costVal) && costVal > 0) {
+                                            newCostMap[month] = costVal;
+                                        }
+                                    }
+                                }
 
                                 let maxIdx = -1; const tempMap = {};
                                 keys.forEach(k => {
-                                    const cleanK = k.replace(/[\s\u200B]/g, '').toLowerCase();
+                                    const cleanK = k.replace(/[\s\u200B"']/g, '').toLowerCase();
                                     let mIdx = -1;
                                     if (['當月','m0','0月','+0月'].includes(cleanK)) mIdx = 0;
                                     else { const m = cleanK.match(/^(\+|＋)?(m)?(\d+)(月)?$/i); if (m) mIdx = parseInt(m[3], 10); }
                                     
-                                    if (mIdx >= 0 && row[k] !== null && row[k] !== undefined && row[k] !== '') {
-                                        let num = parseFloat(String(row[k]).replace(/[%$, ]/g, ''));
-                                        if (mIdx === 0 && num > 1000) return; // 排除總人數誤入
-                                        tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                    if (mIdx >= 0 && row[k] !== null && row[k] !== undefined) {
+                                        let valStr = String(row[k]).replace(/[%$, '"，]/g, '').trim();
+                                        // 嚴格過濾 '-' 或空白字串，避免轉換成 NaN
+                                        if (valStr !== '' && valStr !== '-' && valStr !== 'null') {
+                                            let num = parseFloat(valStr);
+                                            if (!isNaN(num)) {
+                                                if (mIdx === 0 && num > 5000) return; // 排除人數
+                                                tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                            }
+                                        }
                                     }
                                 });
+
                                 if (maxIdx >= 0) {
                                     updatedCount++; const cum = []; let prev = 0;
                                     const [moY, moM] = month.split('/').map(Number);
                                     for (let i = 0; i <= maxIdx; i++) { 
                                         let cur = tempMap[i] !== undefined ? tempMap[i] : prev; 
                                         let inc = cur - prev;
+                                        
                                         if (cutoffDate) {
                                             const targetD = new Date(moY, moM - 1 + i, 1);
                                             if (targetD.getFullYear() === cY && (targetD.getMonth() + 1) === cM) {
                                                 inc *= scaleFactor;
                                                 cur = prev + inc;
+                                                scaledNotice = true;
                                             }
                                         }
                                         cum.push(cur); prev = cur; 
@@ -255,34 +309,40 @@
                                 }
                             });
                             setRoiMap(newRoiMap); setCostMap(newCostMap);
-                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆 ROI & 成本資料！`);
+                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆實際數據與成本！`);
                         } else {
+                            // 留存率解析 (邏輯同上，加強過濾)
                             const newRetMap = { ...retMap };
                             data.forEach(row => {
                                 const keys = Object.keys(row);
-                                const monthKey = keys.find(k => ['month', '年/月', '年月', '月份', '日期'].includes(k.replace(/[\s\u200B]/g, '').toLowerCase()));
+                                const monthKey = keys.find(k => ['month', '年/月', '年月', '月份', '日期'].includes(k.replace(/[\s\u200B"']/g, '').toLowerCase()));
                                 let month = normalizeMonthString(monthKey ? row[monthKey] : null);
-                                if (month) lastSeenMonth = month; else month = lastSeenMonth;
                                 if (!month) return;
                                 
                                 let maxIdx = -1; const tempMap = {};
                                 keys.forEach(k => {
-                                    const cleanK = k.replace(/[\s\u200B]/g, '').toLowerCase();
+                                    const cleanK = k.replace(/[\s\u200B"']/g, '').toLowerCase();
                                     let mIdx = -1;
                                     if (['當月','m0','0月','+0月'].includes(cleanK)) mIdx = 0;
                                     else { const m = cleanK.match(/^(\+|＋)?(m)?(\d+)(月)?$/i); if (m) mIdx = parseInt(m[3], 10); }
                                     
-                                    if (mIdx >= 0 && row[k] !== null && row[k] !== undefined && row[k] !== '') {
-                                        let num = parseFloat(String(row[k]).replace(/[%$, ]/g, ''));
-                                        if (mIdx === 0 && num > 1000) return; 
-                                        tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                    if (mIdx >= 0 && row[k] !== null && row[k] !== undefined) {
+                                        let valStr = String(row[k]).replace(/[%$, '"，]/g, '').trim();
+                                        if (valStr !== '' && valStr !== '-' && valStr !== 'null') {
+                                            let num = parseFloat(valStr);
+                                            if (!isNaN(num)) {
+                                                if (mIdx === 0 && num > 5000) return;
+                                                tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                            }
+                                        }
                                     }
                                 });
+
                                 if (maxIdx >= 0) { 
                                     updatedCount++; const arr = []; 
                                     const [moY, moM] = month.split('/').map(Number);
                                     for (let i = 0; i <= maxIdx; i++) {
-                                        let rv = tempMap[i] || (i === 0 ? 100 : arr[i-1]);
+                                        let rv = tempMap[i] !== undefined ? tempMap[i] : (i === 0 ? 100 : arr[i-1]);
                                         if (cutoffDate) {
                                             const targetD = new Date(moY, moM - 1 + i, 1);
                                             if (targetD.getFullYear() === cY && (targetD.getMonth() + 1) === cM) rv *= scaleFactor;
@@ -293,7 +353,7 @@
                                 }
                             });
                             setRetMap(newRetMap);
-                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆留存率！模型已校正。`);
+                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆留存率！模型已重新校正。`);
                         }
                     } catch (e) { setErrorMsg('解析錯誤：' + e.message); }
                 };
@@ -310,7 +370,6 @@
                         if (!cohortMap[cohort]) cohortMap[cohort] = { name: cohort, color: p.color };
                         cohortMap[cohort][type] = p.value;
                     });
-
                     return (
                         <div className="bg-white/95 backdrop-blur-sm p-4 border border-slate-200 rounded-xl shadow-2xl text-sm z-50 pointer-events-none max-w-lg">
                             <p className="font-bold text-slate-800 mb-3 border-b pb-2">生命週期 (月): {label}</p>
@@ -318,7 +377,7 @@
                                 {Object.values(cohortMap).sort((a,b) => (b.act ?? b.pred) - (a.act ?? a.pred)).map(c => (
                                     <div key={c.name} className="flex justify-between items-center gap-4">
                                         <div className="flex items-center gap-2 whitespace-nowrap">
-                                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{backgroundColor: c.color}}></span>
+                                            <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor: c.color}}></span>
                                             <span className="font-medium text-slate-700">{c.name}</span>
                                             <span className="text-[10px] text-slate-400">{c.act !== undefined ? '(實)' : '(預)'}</span>
                                         </div>
@@ -337,10 +396,10 @@
                     <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 max-w-sm w-full">
                         <div className="flex justify-center mb-6"><div className="bg-indigo-100 p-4 rounded-full"><i data-lucide="lock" className="w-8 h-8 text-indigo-600"></i></div></div>
                         <h2 className="text-2xl font-bold text-slate-800 mb-2 text-center">ROI 預測儀表板</h2>
-                        <p className="text-sm text-slate-500 mb-8 text-center">請輸入密碼以繼續</p>
-                        <input type="password" value={passwordInput} onChange={e => {setPasswordInput(e.target.value); setLoginError(false);}} onKeyDown={e => e.key === 'Enter' && handleLogin()} className={`w-full px-4 py-3 border ${loginError ? 'border-red-300' : 'border-slate-300'} rounded-xl mb-2 text-center focus:outline-none focus:ring-2 focus:ring-indigo-500`} placeholder="密碼：3293" />
-                        {loginError && <p className="text-red-500 text-xs mb-4 text-center">密碼錯誤</p>}
-                        <button onClick={handleLogin} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl transition-all shadow-sm">進入系統</button>
+                        <p className="text-sm text-slate-500 mb-8 text-center">受保護的應用程式，請輸入密碼以繼續</p>
+                        <input type="password" value={passwordInput} onChange={e => {setPasswordInput(e.target.value); setLoginError(false);}} onKeyDown={e => e.key === 'Enter' && handleLogin()} className={`w-full px-4 py-3 border ${loginError ? 'border-red-300' : 'border-slate-300'} rounded-xl mb-2 text-center focus:outline-none focus:ring-2 focus:ring-indigo-500`} placeholder="請輸入通行密碼" />
+                        {loginError && <p className="text-red-500 text-xs mb-4 text-center font-medium">密碼錯誤，請再試一次</p>}
+                        <button onClick={handleLogin} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl transition-all shadow-sm active:scale-[0.98]">進入系統</button>
                     </div>
                 </div>
             );
@@ -351,21 +410,21 @@
                         <div className="flex flex-col xl:flex-row justify-between items-center bg-white p-6 rounded-xl shadow-sm border border-slate-100 gap-6">
                             <h1 className="text-2xl font-bold flex items-center text-slate-800"><i data-lucide="activity" className="w-6 h-6 mr-2 text-indigo-600"></i> 營收與 ROI 動態預測儀表板</h1>
                             <div className="flex flex-wrap gap-3 items-center">
-                                <div className="flex items-center bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                                <div className="flex items-center bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 hover:border-indigo-300 transition-colors">
                                     <i data-lucide="calendar" className="w-4 h-4 text-indigo-600 mr-2"></i>
-                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-500 uppercase">截止日</span><input type="date" value={cutoffDate} onChange={e => setCutoffDate(e.target.value)} className="bg-transparent text-sm font-bold outline-none" /></div>
+                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-500 uppercase">資料截止日</span><input type="date" value={cutoffDate} onChange={e => setCutoffDate(e.target.value)} className="bg-transparent text-sm font-bold outline-none" /></div>
                                 </div>
-                                <div className="flex items-center bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                                <div className="flex items-center bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 hover:border-amber-300 transition-colors">
                                     <i data-lucide="settings" className="w-4 h-4 text-amber-600 mr-2"></i>
-                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-amber-700 uppercase">未來成本</span><input type="number" value={defaultFutureCost} onChange={e => setDefaultFutureCost(Number(e.target.value))} className="bg-transparent text-sm font-bold w-24 outline-none" /></div>
+                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-amber-700 uppercase">預設未來成本</span><input type="number" value={defaultFutureCost} onChange={e => setDefaultFutureCost(Number(e.target.value))} className="bg-transparent text-sm font-bold w-28 outline-none" /></div>
                                 </div>
-                                <div className="relative"><input type="file" onChange={e => handleUpload(e, 'roi')} className="absolute inset-0 opacity-0 cursor-pointer" title="匯入 ROI" /><button className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>1. ROI & 成本</button></div>
-                                <div className="relative"><input type="file" onChange={e => handleUpload(e, 'ret')} className="absolute inset-0 opacity-0 cursor-pointer" title="匯入留存率" /><button className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>2. 留存率</button></div>
+                                <div className="relative group"><input type="file" onChange={e => handleUpload(e, 'roi')} className="absolute inset-0 opacity-0 cursor-pointer" /><button className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center transition-all active:scale-[0.95]"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>1. ROI & 成本</button></div>
+                                <div className="relative group"><input type="file" onChange={e => handleUpload(e, 'ret')} className="absolute inset-0 opacity-0 cursor-pointer" /><button className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center transition-all active:scale-[0.95]"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>2. 留存率</button></div>
                             </div>
                         </div>
 
-                        {errorMsg && <div className="bg-red-50 border border-red-200 text-red-700 px-5 py-4 rounded-xl flex items-center shadow-sm"><i data-lucide="alert-circle" className="w-5 h-5 mr-3 flex-shrink-0"></i>{errorMsg}</div>}
-                        {successMsg && <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-5 py-4 rounded-xl flex items-center shadow-sm"><i data-lucide="trending-up" className="w-5 h-5 mr-3 flex-shrink-0"></i>{successMsg}</div>}
+                        {errorMsg && <div className="bg-red-50 border border-red-200 text-red-700 px-5 py-4 rounded-xl flex items-center shadow-sm animation-fade-in"><i data-lucide="alert-circle" className="w-5 h-5 mr-3 flex-shrink-0"></i>{errorMsg}</div>}
+                        {successMsg && <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-5 py-4 rounded-xl flex items-center shadow-sm animation-fade-in"><i data-lucide="trending-up" className="w-5 h-5 mr-3 flex-shrink-0"></i>{successMsg}</div>}
 
                         <div className="flex space-x-1 bg-white p-1 rounded-xl shadow-sm w-fit border border-slate-100">
                             <button onClick={() => setActiveTab('revenue')} className={`flex items-center px-5 py-2.5 rounded-lg text-sm font-bold transition-all ${activeTab === 'revenue' ? 'bg-indigo-50 text-indigo-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}><i data-lucide="bar-chart-2" className="w-4 h-4 mr-2"></i>總體營收預測</button>
@@ -373,9 +432,9 @@
                         </div>
 
                         {activeTab === 'revenue' ? (
-                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100 animation-fade-in">
                                 <h2 className="text-lg font-bold text-slate-800 mb-6">總體營收預測趨勢 (2025-2028)</h2>
-                                <div className="h-80 w-full">
+                                <div className="h-96 w-full">
                                     <ResponsiveContainer width="100%" height="100%">
                                         <AreaChart data={projections.filter(p => p.month >= '2025/01')} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
                                             <XAxis dataKey="month" fontSize={11} minTickGap={15} stroke="#94a3b8" />
@@ -383,14 +442,14 @@
                                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                                             <RechartsTooltip formatter={v => Math.round(v).toLocaleString()} />
                                             <Legend iconType="circle" />
-                                            <Area type="monotone" dataKey="retRev" name="舊客留存營收" stackId="1" stroke="#10b981" fill="#10b981" fillOpacity={0.6} />
-                                            <Area type="monotone" dataKey="newRev" name="新客首月營收" stackId="1" stroke="#6366f1" fill="#6366f1" fillOpacity={0.6} />
+                                            <Area type="monotone" dataKey="retRev" name="舊客留存營收" stackId="1" stroke="#10b981" fill="#10b981" fillOpacity={0.4} isAnimationActive={false} />
+                                            <Area type="monotone" dataKey="newRev" name="新客首月營收" stackId="1" stroke="#6366f1" fill="#6366f1" fillOpacity={0.6} isAnimationActive={false} />
                                         </AreaChart>
                                     </ResponsiveContainer>
                                 </div>
                             </div>
                         ) : (
-                            <div className="space-y-4">
+                            <div className="space-y-4 animation-fade-in">
                                 <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-100 flex flex-col gap-4">
                                     <div className="flex items-center gap-4 border-b pb-4">
                                         <i data-lucide="filter" className="w-5 h-5 text-slate-400"></i>
@@ -399,7 +458,7 @@
                                             <button key={year} onClick={() => setFilterYear(year)} className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${filterYear === year ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{year === 'All' ? '全部' : year + ' 年'}</button>
                                         ))}
                                     </div>
-                                    <div className="flex flex-wrap gap-2">
+                                    <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto pr-2">
                                         {allMonths.filter(m => filterYear === 'All' || m.startsWith(filterYear)).map(m => (
                                             <label key={m} className={`flex items-center space-x-2 px-3 py-1.5 rounded-md border text-sm cursor-pointer transition-colors ${selectedCohorts.includes(m) ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
                                                 <input type="checkbox" checked={selectedCohorts.includes(m)} className="accent-indigo-600" onChange={() => setSelectedCohorts(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m].sort())} />
@@ -424,7 +483,7 @@
                                                 {selectedCohorts.map(m => (
                                                     <React.Fragment key={m}>
                                                         <Line type="monotone" dataKey={`${m}_act`} stroke={getCohortColor(m)} strokeWidth={3} dot={{r: 3}} isAnimationActive={false} strokeOpacity={0.9} />
-                                                        <Line type="monotone" dataKey={`${m}_pred`} stroke={getCohortColor(m)} strokeWidth={2} strokeDasharray="5 5" dot={false} isAnimationActive={false} strokeOpacity={0.7} />
+                                                        <Line type="monotone" dataKey={`${m}_pred`} stroke={getCohortColor(m)} strokeWidth={2.5} strokeDasharray="5 5" dot={false} isAnimationActive={false} strokeOpacity={0.7} />
                                                     </React.Fragment>
                                                 ))}
                                             </LineChart>
