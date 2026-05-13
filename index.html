@@ -1,1 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROI 預測與動態調整儀表板</title>
+    <!-- 載入必要的外掛套件 (CDN) - 嚴格遵守載入順序 -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+    <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <!-- Lucide 圖示套件 -->
+    <script src="https://unpkg.com/lucide@latest"></script>
 
+    <style>
+        body { background-color: #f8fafc; font-family: sans-serif; }
+        .recharts-default-tooltip { border: none !important; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1) !important; border-radius: 12px !important; }
+        input[type="date"]::-webkit-calendar-picker-indicator { cursor: pointer; filter: invert(0.5); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+        const { 
+            AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip: RechartsTooltip, Legend, ResponsiveContainer,
+            LineChart, Line, ReferenceLine, Label 
+        } = Recharts;
+
+        // 產生 2025 - 2028 月份
+        const generateAllMonths = () => {
+            const months = [];
+            for (let y = 2025; y <= 2028; y++) {
+                for (let m = 1; m <= 12; m++) {
+                    months.push(`${y}/${m.toString().padStart(2, '0')}`);
+                }
+            }
+            return months;
+        };
+
+        const allMonths = generateAllMonths();
+
+        const getCohortColor = (cohortStr) => {
+            const colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1', '#000075', '#808080'];
+            let hash = 0;
+            for (let i = 0; i < cohortStr.length; i++) hash += cohortStr.charCodeAt(i);
+            return colors[hash % colors.length];
+        };
+
+        function App() {
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [passwordInput, setPasswordInput] = useState('');
+            const [loginError, setLoginError] = useState(false);
+            const [activeTab, setActiveTab] = useState('cohort'); 
+            const [errorMsg, setErrorMsg] = useState('');
+            const [successMsg, setSuccessMsg] = useState('');
+            
+            const [roiMap, setRoiMap] = useState({});
+            const [costMap, setCostMap] = useState({});
+            const [retMap, setRetMap] = useState({});
+            const [defaultFutureCost, setDefaultFutureCost] = useState(50000000);
+            const [cutoffDate, setCutoffDate] = useState('');
+            const [filterYear, setFilterYear] = useState('All'); 
+            const [selectedCohorts, setSelectedCohorts] = useState([]);
+
+            const showSuccess = (msg) => {
+                setSuccessMsg(msg);
+                setTimeout(() => setSuccessMsg(''), 6000);
+            };
+
+            // 初始化 Lucide 圖示
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            });
+
+            useEffect(() => {
+                const defaultView = filterYear === 'All' 
+                    ? allMonths.filter(m => m >= '2025/01' && m <= '2026/12') 
+                    : allMonths.filter(m => m.startsWith(filterYear));
+                setSelectedCohorts(defaultView);
+            }, [filterYear]);
+
+            const projectedData = useMemo(() => {
+                const avgRet = []; const avgInc = [];
+                for (let i = 0; i <= 60; i++) {
+                    let sumRet = 0, countRet = 0, sumInc = 0, countInc = 0;
+                    allMonths.forEach(m => {
+                        if (retMap[m] && retMap[m][i] !== undefined) { sumRet += retMap[m][i]; countRet++; }
+                        if (roiMap[m] && i < roiMap[m].length) { 
+                            let inc = i === 0 ? roiMap[m][0] : (roiMap[m][i] - roiMap[m][i-1]); 
+                            sumInc += inc; countInc++; 
+                        }
+                    });
+                    avgRet[i] = countRet > 0 ? sumRet / countRet : (i === 0 ? 100 : (avgRet[i-1] * 0.8 || 0));
+                    avgInc[i] = countInc > 0 ? sumInc / countInc : (i === 0 ? 30 : (avgInc[i-1] * 0.8 || 0));
+                }
+
+                const fullCohorts = {};
+                allMonths.forEach(month => {
+                    const actualCum = roiMap[month] || [];
+                    const cohortCost = costMap[month] !== undefined ? costMap[month] : defaultFutureCost;
+                    const predCum = []; const predInc = [];
+                    let currentCum = 0; let lastInc = 0;
+
+                    for (let i = 0; i <= 36; i++) {
+                        if (i < actualCum.length) {
+                            currentCum = actualCum[i]; 
+                            lastInc = i === 0 ? currentCum : (actualCum[i] - actualCum[i-1]);
+                        } else {
+                            let decay = 0.8;
+                            if (avgRet[i] && avgRet[i-1] > 0) decay = avgRet[i] / avgRet[i-1];
+                            else if (avgInc[i] && avgInc[i-1] > 0) decay = avgInc[i] / avgInc[i-1];
+                            decay = Math.max(0.05, Math.min(1.2, decay));
+                            let nextInc = actualCum.length === 0 && i === 0 ? (avgInc[0] || 40) : (lastInc * decay);
+                            currentCum += nextInc; lastInc = nextInc;
+                        }
+                        predCum[i] = currentCum; predInc[i] = lastInc;
+                    }
+                    fullCohorts[month] = { cost: cohortCost, actualLen: actualCum.length, cum: predCum, inc: predInc };
+                });
+                return fullCohorts;
+            }, [roiMap, costMap, retMap, defaultFutureCost]);
+
+            const cumulativeChartData = useMemo(() => {
+                const data = [];
+                for (let i = 0; i <= 36; i++) {
+                    let row = { name: `M${i}`, age: i };
+                    selectedCohorts.forEach(month => {
+                        const cData = projectedData[month];
+                        if (cData) {
+                            if (i < cData.actualLen) { 
+                                row[`${month}_act`] = parseFloat(cData.cum[i].toFixed(2)); 
+                                if (i === cData.actualLen - 1) row[`${month}_pred`] = parseFloat(cData.cum[i].toFixed(2)); 
+                            }
+                            else { row[`${month}_pred`] = parseFloat(cData.cum[i].toFixed(2)); }
+                        }
+                    });
+                    data.push(row);
+                }
+                return data;
+            }, [projectedData, selectedCohorts]);
+
+            const projections = useMemo(() => {
+                return allMonths.map(targetMonth => {
+                    const targetIdx = allMonths.indexOf(targetMonth);
+                    let newRev = 0, retRev = 0;
+                    const budget = projectedData[targetMonth]?.cost || defaultFutureCost;
+                    allMonths.forEach(cohort => {
+                        const cIdx = allMonths.indexOf(cohort);
+                        if (cIdx <= targetIdx && targetIdx - cIdx <= 36) {
+                            const age = targetIdx - cIdx;
+                            const cData = projectedData[cohort];
+                            const rev = cData.cost * ((cData.inc[age] || 0) / 100.0);
+                            if (age === 0) newRev += rev; else retRev += rev;
+                        }
+                    });
+                    return { month: targetMonth, newRev, retRev, totalRev: newRev + retRev, budget, roas: budget > 0 ? (newRev + retRev) / budget * 100 : 0 };
+                });
+            }, [projectedData, defaultFutureCost]);
+
+            const normalizeMonthString = (rawStr) => {
+                if (!rawStr) return null;
+                let s = String(rawStr).trim();
+                if (!isNaN(s) && Number(s) > 30000) { const d = new Date(Math.round((Number(s)-25569)*86400*1000)); return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}`; }
+                s = s.replace(/[-_年\.]/g, '/').replace(/月/g, '');
+                const mYm = s.match(/^(\d{2,4})\/(\d{1,2})/);
+                if (mYm) return `${mYm[1].length===2?'20'+mYm[1]:mYm[1]}/${String(mYm[2]).padStart(2,'0')}`;
+                return s;
+            };
+
+            const handleLogin = () => { if (passwordInput === '3293') { setIsAuthenticated(true); } else { setLoginError(true); } };
+
+            const handleUpload = (e, type) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                let scaleFactor = 1;
+                let cY, cM, cD;
+                if (cutoffDate) {
+                    const dt = new Date(cutoffDate);
+                    cY = dt.getFullYear(); cM = dt.getMonth() + 1; cD = dt.getDate();
+                    scaleFactor = new Date(cY, cM, 0).getDate() / cD;
+                }
+
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    try {
+                        const dataArray = new Uint8Array(evt.target.result);
+                        const wb = XLSX.read(dataArray, { type: 'array' });
+                        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: false, defval: null });
+                        let updatedCount = 0;
+                        let lastSeenMonth = null;
+
+                        if (type === 'roi') {
+                            const newRoiMap = { ...roiMap }; const newCostMap = { ...costMap };
+                            data.forEach(row => {
+                                const keys = Object.keys(row);
+                                const monthKey = keys.find(k => ['month', '年/月', '年月', '月份', '日期'].includes(k.replace(/[\s]/g, '').toLowerCase()));
+                                let month = normalizeMonthString(monthKey ? row[monthKey] : null);
+                                if (month) lastSeenMonth = month; else month = lastSeenMonth;
+                                if (!month) return;
+
+                                const costKey = keys.find(k => k.includes('cost') || k.includes('成本') || k.includes('花費') || k.includes('人數或花費'));
+                                if (costKey && row[costKey]) newCostMap[month] = parseFloat(String(row[costKey]).replace(/[%$, ]/g, ''));
+
+                                let maxIdx = -1; const tempMap = {};
+                                keys.forEach(k => {
+                                    const cleanK = k.replace(/[\s\u200B]/g, '').toLowerCase();
+                                    let mIdx = -1;
+                                    if (['當月','m0','0月','+0月'].includes(cleanK)) mIdx = 0;
+                                    else { const m = cleanK.match(/^(\+)?(m)?(\d+)(月)?$/i); if (m) mIdx = parseInt(m[3], 10); }
+                                    if (mIdx >= 0 && row[k]) {
+                                        let num = parseFloat(String(row[k]).replace(/[%$, ]/g, ''));
+                                        if (mIdx === 0 && num > 1000) return;
+                                        tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                    }
+                                });
+                                if (maxIdx >= 0) {
+                                    updatedCount++; const cum = []; let prev = 0;
+                                    const [moY, moM] = month.split('/').map(Number);
+                                    for (let i = 0; i <= maxIdx; i++) { 
+                                        let cur = tempMap[i] !== undefined ? tempMap[i] : prev; 
+                                        let inc = cur - prev;
+                                        if (cutoffDate) {
+                                            const targetD = new Date(moY, moM - 1 + i, 1);
+                                            if (targetD.getFullYear() === cY && (targetD.getMonth() + 1) === cM) {
+                                                inc *= scaleFactor;
+                                                cur = prev + inc;
+                                            }
+                                        }
+                                        cum.push(cur); prev = cur; 
+                                    }
+                                    newRoiMap[month] = cum;
+                                }
+                            });
+                            setRoiMap(newRoiMap); setCostMap(newCostMap);
+                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆 ROI & 成本資料！`);
+                        } else {
+                            const newRetMap = { ...retMap };
+                            data.forEach(row => {
+                                const keys = Object.keys(row);
+                                const monthKey = keys.find(k => ['month', '年/月', '年月', '月份', '日期'].includes(k.replace(/[\s]/g, '').toLowerCase()));
+                                let month = normalizeMonthString(monthKey ? row[monthKey] : null);
+                                if (month) lastSeenMonth = month; else month = lastSeenMonth;
+                                if (!month) return;
+                                let maxIdx = -1; const tempMap = {};
+                                keys.forEach(k => {
+                                    const cleanK = k.replace(/[\s\u200B]/g, '').toLowerCase();
+                                    let mIdx = -1;
+                                    if (['當月','m0','0月','+0月'].includes(cleanK)) mIdx = 0;
+                                    else { const m = cleanK.match(/^(\+)?(m)?(\d+)(月)?$/i); if (m) mIdx = parseInt(m[3], 10); }
+                                    if (mIdx >= 0 && row[k]) {
+                                        let num = parseFloat(String(row[k]).replace(/[%$, ]/g, ''));
+                                        if (mIdx === 0 && num > 1000) return;
+                                        tempMap[mIdx] = num; maxIdx = Math.max(maxIdx, mIdx);
+                                    }
+                                });
+                                if (maxIdx >= 0) { 
+                                    updatedCount++; const arr = []; 
+                                    const [moY, moM] = month.split('/').map(Number);
+                                    for (let i = 0; i <= maxIdx; i++) {
+                                        let rv = tempMap[i] || (i === 0 ? 100 : arr[i-1]);
+                                        if (cutoffDate) {
+                                            const targetD = new Date(moY, moM - 1 + i, 1);
+                                            if (targetD.getFullYear() === cY && (targetD.getMonth() + 1) === cM) rv *= scaleFactor;
+                                        }
+                                        arr.push(rv);
+                                    }
+                                    newRetMap[month] = arr; 
+                                }
+                            });
+                            setRetMap(newRetMap);
+                            if (updatedCount) showSuccess(`✅ 成功載入 ${updatedCount} 筆留存率！已動態調整預測模型。`);
+                        }
+                    } catch (e) { setErrorMsg('解析錯誤：' + e.message); }
+                };
+                reader.readAsArrayBuffer(file);
+                e.target.value = null;
+            };
+
+            const CustomCohortTooltip = ({ active, payload, label }) => {
+                if (active && payload && payload.length) {
+                    const cohortMap = {};
+                    payload.forEach(p => {
+                        const cohort = p.dataKey.split('_')[0];
+                        const type = p.dataKey.split('_')[1];
+                        if (!cohortMap[cohort]) cohortMap[cohort] = { name: cohort, color: p.color };
+                        cohortMap[cohort][type] = p.value;
+                    });
+
+                    return (
+                        <div className="bg-white/95 backdrop-blur-sm p-4 border border-slate-200 rounded-xl shadow-2xl text-sm z-50 pointer-events-none">
+                            <p className="font-bold text-slate-800 mb-3 border-b pb-2">生命週期 (月): {label}</p>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2">
+                                {Object.values(cohortMap).sort((a,b) => (b.act ?? b.pred) - (a.act ?? a.pred)).map(c => (
+                                    <div key={c.name} className="flex justify-between items-center gap-4">
+                                        <div className="flex items-center gap-2 whitespace-nowrap">
+                                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{backgroundColor: c.color}}></span>
+                                            <span className="font-medium text-slate-700">{c.name}</span>
+                                            <span className="text-[10px] text-slate-400">{c.act !== undefined ? '(實際)' : '(預估)'}</span>
+                                        </div>
+                                        <span className="font-bold" style={{color: c.color}}>{(c.act ?? c.pred).toFixed(1)}%</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    );
+                }
+                return null;
+            };
+
+            if (!isAuthenticated) return (
+                <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+                    <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 max-w-sm w-full">
+                        <div className="flex justify-center mb-6"><div className="bg-indigo-100 p-4 rounded-full"><i data-lucide="lock" className="w-8 h-8 text-indigo-600"></i></div></div>
+                        <h2 className="text-2xl font-bold text-slate-800 mb-2 text-center">ROI 預測儀表板</h2>
+                        <p className="text-sm text-slate-500 mb-8 text-center">受保護的應用程式，請輸入密碼</p>
+                        <input type="password" value={passwordInput} onChange={e => {setPasswordInput(e.target.value); setLoginError(false);}} onKeyDown={e => e.key === 'Enter' && handleLogin()} className={`w-full px-4 py-3 border ${loginError ? 'border-red-300' : 'border-slate-300'} rounded-xl mb-2 text-center focus:outline-none focus:ring-2 focus:ring-indigo-500`} placeholder="請輸入密碼 3293" />
+                        {loginError && <p className="text-red-500 text-xs mb-4 text-center">密碼錯誤，請再試一次</p>}
+                        <button onClick={handleLogin} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-xl transition-all shadow-sm">進入系統</button>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="min-h-screen bg-slate-50 p-6">
+                    <div className="max-w-7xl mx-auto space-y-6">
+                        <div className="flex flex-col xl:flex-row justify-between items-center bg-white p-6 rounded-xl shadow-sm border border-slate-100 gap-6">
+                            <h1 className="text-2xl font-bold flex items-center text-slate-800"><i data-lucide="activity" className="w-6 h-6 mr-2 text-indigo-600"></i> 營收與 ROI 動態預測儀表板</h1>
+                            <div className="flex flex-wrap gap-3 items-center">
+                                <div className="flex items-center bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                                    <i data-lucide="calendar" className="w-4 h-4 text-indigo-600 mr-2"></i>
+                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-slate-500 uppercase">截止日</span><input type="date" value={cutoffDate} onChange={e => setCutoffDate(e.target.value)} className="bg-transparent text-sm font-bold outline-none" /></div>
+                                </div>
+                                <div className="flex items-center bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                                    <i data-lucide="settings" className="w-4 h-4 text-amber-600 mr-2"></i>
+                                    <div className="flex flex-col"><span className="text-[10px] font-bold text-amber-700 uppercase">預估未來成本</span><input type="number" value={defaultFutureCost} onChange={e => setDefaultFutureCost(Number(e.target.value))} className="bg-transparent text-sm font-bold w-24 outline-none" /></div>
+                                </div>
+                                <div className="relative"><input type="file" onChange={e => handleUpload(e, 'roi')} className="absolute inset-0 opacity-0 cursor-pointer" title="匯入 ROI" /><button className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>1. ROI & 成本</button></div>
+                                <div className="relative"><input type="file" onChange={e => handleUpload(e, 'ret')} className="absolute inset-0 opacity-0 cursor-pointer" title="匯入留存率" /><button className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium shadow-sm flex items-center"><i data-lucide="upload" className="w-4 h-4 mr-2"></i>2. 留存率</button></div>
+                            </div>
+                        </div>
+
+                        {errorMsg && <div className="bg-red-50 border border-red-200 text-red-700 px-5 py-4 rounded-xl flex items-center shadow-sm"><i data-lucide="alert-circle" className="w-5 h-5 mr-3 flex-shrink-0"></i>{errorMsg}</div>}
+                        {successMsg && <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-5 py-4 rounded-xl flex items-center shadow-sm"><i data-lucide="trending-up" className="w-5 h-5 mr-3 flex-shrink-0"></i>{successMsg}</div>}
+
+                        <div className="flex space-x-1 bg-white p-1 rounded-xl shadow-sm w-fit border border-slate-100">
+                            <button onClick={() => setActiveTab('revenue')} className={`flex items-center px-5 py-2.5 rounded-lg text-sm font-bold transition-all ${activeTab === 'revenue' ? 'bg-indigo-50 text-indigo-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}><i data-lucide="bar-chart-2" className="w-4 h-4 mr-2"></i>總體營收預測</button>
+                            <button onClick={() => setActiveTab('cohort')} className={`flex items-center px-5 py-2.5 rounded-lg text-sm font-bold transition-all ${activeTab === 'cohort' ? 'bg-indigo-50 text-indigo-700 shadow-sm' : 'text-slate-500 hover:bg-slate-50'}`}><i data-lucide="trending-up" className="w-4 h-4 mr-2"></i>各月份 ROI 累積曲線</button>
+                        </div>
+
+                        {activeTab === 'revenue' ? (
+                            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                <h2 className="text-lg font-bold text-slate-800 mb-6">總體營收預測趨勢 (2025 起)</h2>
+                                <div className="h-80 w-full">
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        <AreaChart data={projections.filter(p => p.month >= '2025/01')} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                                            <XAxis dataKey="month" fontSize={12} minTickGap={20} stroke="#94a3b8" />
+                                            <YAxis fontSize={12} tickFormatter={v => (v/1000000).toFixed(0) + 'M'} stroke="#94a3b8" />
+                                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                                            <RechartsTooltip formatter={v => v.toLocaleString()} />
+                                            <Legend iconType="circle" />
+                                            <Area type="monotone" dataKey="retRev" name="舊客留存營收" stackId="1" stroke="#10b981" fill="#10b981" fillOpacity={0.6} />
+                                            <Area type="monotone" dataKey="newRev" name="新客營收" stackId="1" stroke="#6366f1" fill="#6366f1" fillOpacity={0.6} />
+                                        </AreaChart>
+                                    </ResponsiveContainer>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-100 flex flex-col gap-4">
+                                    <div className="flex items-center gap-4 border-b pb-4">
+                                        <i data-lucide="filter" className="w-5 h-5 text-slate-400"></i>
+                                        <span className="font-bold text-slate-700">年度快篩：</span>
+                                        {['All', '2025', '2026', '2027', '2028'].map(year => (
+                                            <button key={year} onClick={() => setFilterYear(year)} className={`px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${filterYear === year ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{year === 'All' ? '全部' : year + ' 年'}</button>
+                                        ))}
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {allMonths.filter(m => filterYear === 'All' || m.startsWith(filterYear)).map(m => (
+                                            <label key={m} className={`flex items-center space-x-2 px-3 py-1.5 rounded-md border text-sm cursor-pointer transition-colors ${selectedCohorts.includes(m) ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
+                                                <input type="checkbox" checked={selectedCohorts.includes(m)} className="accent-indigo-600" onChange={() => setSelectedCohorts(prev => prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m].sort())} />
+                                                <span className="w-3 h-3 rounded-full shadow-sm" style={{backgroundColor: getCohortColor(m)}}></span>
+                                                <span className="font-medium text-slate-700">{m}</span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                                    <h2 className="text-lg font-bold text-slate-800 mb-6">各月份 ROI 累積曲線</h2>
+                                    <div className="h-[500px] w-full">
+                                        <ResponsiveContainer width="100%" height="100%">
+                                            <LineChart data={cumulativeChartData} margin={{ top: 20, right: 30, left: 10, bottom: 20 }}>
+                                                <XAxis dataKey="name" fontSize={12} stroke="#94a3b8" />
+                                                <YAxis fontSize={12} tickFormatter={v => v + '%'} stroke="#94a3b8" />
+                                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                                                <RechartsTooltip content={<CustomCohortTooltip />} />
+                                                <ReferenceLine y={100} stroke="#ef4444" strokeDasharray="6 6" strokeWidth={2}>
+                                                    <Label value="100% 損益兩平線" position="insideTopLeft" fill="#ef4444" fontSize={12} fontWeight="bold" />
+                                                </ReferenceLine>
+                                                {selectedCohorts.map(m => (
+                                                    <React.Fragment key={m}>
+                                                        <Line type="monotone" dataKey={`${m}_act`} stroke={getCohortColor(m)} strokeWidth={3} dot={{r: 4}} isAnimationActive={false} />
+                                                        <Line type="monotone" dataKey={`${m}_pred`} stroke={getCohortColor(m)} strokeWidth={2.5} strokeDasharray="6 4" dot={false} isAnimationActive={false} />
+                                                    </React.Fragment>
+                                                ))}
+                                            </LineChart>
+                                        </ResponsiveContainer>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
